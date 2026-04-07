@@ -149,17 +149,18 @@ class MobForgeNet(nn.Module):
         self.encoder_srm = make_encoder(False)  # SRM stream: no pretrain (noise domain)
 
         # Channel sizes at each stage of MobileNetV3-Small features
-        # Layers 0,1,2,4,9 give us multi-scale feature maps
-        self.skip_channels = [16, 16, 24, 48, 576]  # MV3-Small feature channels
+        # Layers 1,2,4,9 give us 4 multi-scale feature maps; layer 12 is bottleneck
+        self.skip_channels = [16, 24, 40, 96]  # MV3-Small feature channels at skips (not bottleneck)
+        self.bottleneck_channels = 576  # Output of layer 12
 
         # Fusion at bottleneck
-        self.fuse = ChannelAttentionFusion(self.skip_channels[-1])
+        self.fuse = ChannelAttentionFusion(self.bottleneck_channels)
 
-        # U-Net Decoder
-        self.dec4 = DecoderBlock(self.skip_channels[-1], self.skip_channels[-2], 256)
-        self.dec3 = DecoderBlock(256, self.skip_channels[-3], 128)
-        self.dec2 = DecoderBlock(128, self.skip_channels[-4], 64)
-        self.dec1 = DecoderBlock(64,  self.skip_channels[-5], 32)
+        # U-Net Decoder: dec4 expects bottleneck + skip[3]
+        self.dec4 = DecoderBlock(self.bottleneck_channels, self.skip_channels[-1], 256)
+        self.dec3 = DecoderBlock(256, self.skip_channels[-2], 128)
+        self.dec2 = DecoderBlock(128, self.skip_channels[-3], 64)
+        self.dec1 = DecoderBlock(64,  self.skip_channels[-4], 32)
         self.dec0 = DecoderBlock(32,  0, 16)
 
         # Final prediction head
@@ -172,12 +173,12 @@ class MobForgeNet(nn.Module):
     def _get_skips(self, encoder, x):
         """Extract multi-scale skip features from MobileNetV3 encoder."""
         skips = []
-        skip_indices = [1, 2, 4, 9, 12]  # feature map indices
+        skip_indices = [1, 2, 4, 9]  # Only 4 skips; layer 12 is bottleneck
         for i, layer in enumerate(encoder):
             x = layer(x)
             if i in skip_indices:
                 skips.append(x)
-        return x, skips  # (bottleneck, [skip1..skip5])
+        return x, skips  # (bottleneck at layer 12, [skip1..skip4])
 
     def forward(self, x):
         # Stream 1: RGB
@@ -190,11 +191,11 @@ class MobForgeNet(nn.Module):
         # Fuse bottlenecks
         fused = self.fuse(bottleneck_rgb, bottleneck_srm)
 
-        # U-Net decode with RGB skip connections
-        d = self.dec4(fused,  skips_rgb[4])
-        d = self.dec3(d,      skips_rgb[3])
-        d = self.dec2(d,      skips_rgb[2])
-        d = self.dec1(d,      skips_rgb[1])
+        # U-Net decode with RGB skip connections (reversed order)
+        d = self.dec4(fused,  skips_rgb[3])
+        d = self.dec3(d,      skips_rgb[2])
+        d = self.dec2(d,      skips_rgb[1])
+        d = self.dec1(d,      skips_rgb[0])
         d = self.dec0(d,      None)
 
         # Upsample to input resolution

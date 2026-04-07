@@ -68,7 +68,7 @@ def create_output_image(original_img, prob_map, inference_ms, save_path):
     overlay = Image.fromarray(overlay_arr)
 
     # Binary mask
-    binary_arr = (prob_arr > thresh_pixel).astype(np.uint8) * 255
+    binary_arr = (prob_arr > 127).astype(np.uint8) * 255
     binary_img = Image.fromarray(binary_arr).convert('RGB')
 
     # Compose side-by-side
@@ -93,9 +93,8 @@ def create_output_image(original_img, prob_map, inference_ms, save_path):
                   label, fill=color, anchor='mt')
 
     # Inference speed line — the key output your reviewer asked for
-    thresh_pixel = int(saved_threshold * 255)
-    forgery_pct  = (prob_arr > thresh_pixel).mean() * 100
-    speed_text   = (
+    forgery_pct = (prob_arr > 127).mean() * 100
+    speed_text  = (
         f"Inference time: {inference_ms:.1f} ms  |  "
         f"Forged area: {forgery_pct:.1f}%  |  "
         f"Model: MobForge-Net  |  Input: {orig_w}×{orig_h}px"
@@ -110,25 +109,16 @@ def create_output_image(original_img, prob_map, inference_ms, save_path):
 # ─────────────────────────────────────────────
 # Main inference
 # ─────────────────────────────────────────────
-def run_inference(image_path, weights_path, img_size=256, device=None, save_dir='outputs'):
+def run_inference(image_path, weights_path, img_size=256, device=None, save_dir='outputs', mask_path=None):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Load model + saved threshold
+    # Load model
     model = MobForgeNet(pretrained=False)
-    saved_threshold = 0.5  # default
     if os.path.exists(weights_path):
-        checkpoint = torch.load(weights_path, map_location=device)
-        # Handle both plain state_dict and our new checkpoint format
-        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'])
-            saved_threshold = checkpoint.get('threshold', 0.5)
-            saved_f1        = checkpoint.get('f1', 0.0)
-            print(f"Loaded weights: {weights_path}")
-            print(f"  Checkpoint F1={saved_f1:.4f}, threshold={saved_threshold:.2f}")
-        else:
-            model.load_state_dict(checkpoint)
-            print(f"Loaded weights: {weights_path}")
+        state = torch.load(weights_path, map_location=device)
+        model.load_state_dict(state)
+        print(f"Loaded weights: {weights_path}")
     else:
         print(f"[WARNING] No weights found at {weights_path}. Running with random weights (demo only).")
     model.to(device)
@@ -157,6 +147,35 @@ def run_inference(image_path, weights_path, img_size=256, device=None, save_dir=
     # Post-process
     prob_map = pred[0, 0].cpu().numpy()  # [H, W], values in [0,1]
 
+    # Load ground truth mask if provided
+    accuracy = None
+    precision = None
+    recall = None
+    f1 = None
+    iou = None
+    dice = None
+
+    if mask_path and os.path.exists(mask_path):
+        gt_mask = Image.open(mask_path).convert('L')
+        gt_mask = gt_mask.resize((img_size, img_size), Image.NEAREST)
+        gt_mask = np.array(gt_mask) / 255.0  # Normalize to [0,1]
+        gt_mask = (gt_mask > 0.5).astype(np.float32)  # Binary
+
+        pred_binary = (prob_map > 0.5).astype(np.float32)
+        tp = float(((pred_binary == 1) & (gt_mask == 1)).sum())
+        fp = float(((pred_binary == 1) & (gt_mask == 0)).sum())
+        tn = float(((pred_binary == 0) & (gt_mask == 0)).sum())
+        fn = float(((pred_binary == 0) & (gt_mask == 1)).sum())
+
+        correct_pixels = (pred_binary == gt_mask).sum()
+        total_pixels = gt_mask.size
+        accuracy = (correct_pixels / total_pixels) * 100
+        precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+        recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+        iou = tp / (tp + fp + fn) if tp + fp + fn > 0 else 0.0
+        dice = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 0.0
+
     # Save result
     os.makedirs(save_dir, exist_ok=True)
     base_name  = os.path.splitext(os.path.basename(image_path))[0]
@@ -174,7 +193,14 @@ def run_inference(image_path, weights_path, img_size=256, device=None, save_dir=
     print(f"  Inference time: {inference_ms:.2f} ms  ({1000/inference_ms:.1f} FPS)")
     print(f"  Device        : {device}")
     print(f"  Forged area   : {forgery_pct:.2f}%")
-    verdict = "FORGED" if forgery_pct > 2 else "AUTHENTIC"
+    if accuracy is not None:
+        print(f"  Accuracy      : {accuracy:.2f}%")
+        print(f"  Precision     : {precision:.4f}")
+        print(f"  Recall        : {recall:.4f}")
+        print(f"  F1 Score      : {f1:.4f}")
+        print(f"  IoU           : {iou:.4f}")
+        print(f"  Dice          : {dice:.4f}")
+    verdict = "FORGED" if forgery_pct > 5 else "AUTHENTIC"
     print(f"  Verdict       : {verdict}")
     print(f"  Output saved  : {out_path}")
     print(f"{'='*55}\n")
@@ -183,6 +209,7 @@ def run_inference(image_path, weights_path, img_size=256, device=None, save_dir=
         'inference_ms': inference_ms,
         'fps': 1000 / inference_ms,
         'forgery_pct': forgery_pct,
+        'accuracy': accuracy,
         'verdict': verdict,
         'output_path': out_path
     }
@@ -226,6 +253,7 @@ def benchmark_speed(weights_path, img_size=256, n_runs=50, batch_sizes=[1, 4, 8]
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--image',   type=str, default=None)
+    parser.add_argument('--mask',    type=str, default=None, help='Ground truth mask path for accuracy calculation')
     parser.add_argument('--weights', type=str, default='checkpoints/best_model.pth')
     parser.add_argument('--size',    type=int, default=256)
     parser.add_argument('--outdir',  type=str, default='outputs')
@@ -235,7 +263,7 @@ if __name__ == '__main__':
     if args.benchmark:
         benchmark_speed(args.weights, args.size)
     elif args.image:
-        run_inference(args.image, args.weights, args.size, save_dir=args.outdir)
+        run_inference(args.image, args.weights, args.size, save_dir=args.outdir, mask_path=args.mask)
     else:
-        print("Usage: python inference.py --image img.jpg --weights checkpoints/best_model.pth")
+        print("Usage: python inference.py --image img.jpg --weights checkpoints/best_model.pth [--mask mask.png]")
         print("       python inference.py --benchmark")
